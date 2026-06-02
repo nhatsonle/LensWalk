@@ -1,0 +1,188 @@
+tools:
+  - name: segment_observer
+    class: single_segment_observer
+    description: >
+      Probes the contents of video frames within a single time interval of a video by querying an MLLM under your specified frame sampling conditions.
+      Returns:
+       str: The model's response to the question based on sampled frames.
+      Notes:
+      - Designed for focused, higher-resolution probing of a specific segment compared to broad scanning tools.
+      - The sampling budget is constrained by the stricter of fps and max_total_frames (including default). The tool's frame limit is the default value of max_total_frames.
+    base_fps: &segmentO_base_fps 1
+    base_frame_num: &segmentO_total_frames 32
+    defs:
+      TimeInterval:
+        type: object
+        description: >
+          Time interval in seconds.
+        properties:
+          start_sec: { type: number, minimum: 0, description: "Start time in seconds (>= 0)." }
+          end_sec:   { type: number, exclusiveMinimum: 0, description: "End time in seconds (> start_sec)." }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+
+    arguments:
+      interval:
+        description: Time range to analyze.
+        $ref: "#/$defs/TimeInterval"
+        required: true
+
+      query:
+        description: The question for the MLLM within the interval.
+        type: string
+        required: true
+
+      fps:
+        description: Global sampling rate (fps) of the interval. Must be given when max_total_frames is omitted.
+        type: number
+        exclusiveMinimum: 0
+        default: *segmentO_base_fps
+
+      max_total_frames:
+        description: Max total frames to extract for the interval. Must be given when max_total_frames is omitted. The default value is the max sampled frame number of the tool.
+        type: integer
+        minimum: 1
+        default: *segmentO_total_frames
+
+  - name: stitched_observer
+    class: stitched_segment_observer
+    description: >
+      Probes the contents of multiple disjoint time segments with specified sampling settings to focus on key events or exclude irrelevant scenes. It stitches the segments into one batch with mixed sampling rates and queries an MLLM with a unified question over them.
+      Returns:
+       str: The model's response to the question based on sampled frames.
+      
+      Notes:
+      - Powerful when you need to observe complex content involving multiple events or long time spans, or to perform joint verification through localized observations.
+      - The sampling budget is constrained by the stricter of fps and max_total_frames (including default). When the sampling budget is reached, frames are allocated proportionally based on the ratio between the specified segment and the total time range sampling rate.
+    _type: func
+    base_fps: &stitchedO_base_fps 0.5
+    base_frame_num: &stitchedO_total_frames 128
+    base_segment_fps: &stitchedO_seg_base_fps 1
+    defs:
+      TimeInterval:
+        type: object
+        description: >
+          Time interval in seconds. 
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec:   { type: number, exclusiveMinimum: 0 }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+
+      SubTimeIntervalWFPS:
+        type: object
+        description: >
+          Time interval in seconds with optional fps (>0). Used for segments. If omitted, fps defaults to 1.0. 
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec:   { type: number, exclusiveMinimum: 0 }
+          fps:       { type: number, exclusiveMinimum: 0, default: *stitchedO_seg_base_fps }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+
+    arguments:
+      segments:
+        description: Non-empty list of time segments with per-segment sampling settings to emphasize key intervals and down-weight noncritical ones in the global analysis; each item is a SubTimeIntervalWFPS.
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/$defs/SubTimeIntervalWFPS"
+        required: true
+
+      query:
+        description: Unified question for stitched analysis.
+        type: string
+        required: true
+
+      global_interval:
+        description: Optional global time range guiding sampling and coverage. If omitted, the MLLM sees only the requested disjoint video segments, separated by delimiters.
+        $ref: "#/$defs/TimeInterval"
+
+      fps:
+        description: Base sampling rate for global time interval. Must be given when max_total_frames is omitted.
+        type: number
+        exclusiveMinimum: 0
+        default: *stitchedO_base_fps
+
+      max_total_frames:
+        description: Optional global upper bound on total frames. Must be given when max_total_frames is omitted. The default value is the max sampled frame number of the tool.
+        type: integer
+        minimum: 1
+        default: *stitchedO_total_frames
+
+  - name: scan_observer
+    class: per_segment_scan_observer
+    description: >
+      Scans a video over a specified global time interval by partitioning it into equal slices (num_slices) or fixed-duration slices (slice_duration_sec). For each slice, it sparsely samples frames (controlled by fps and frame budget) and queries a visual LLM to judge relevance to the user's query, returning a concise per-slice summary and rationale.
+
+      Returns:
+        One line per slice in chronological order:
+        [start_sec, end_sec]: <model reply>
+
+      Notes:
+        - Purpose: effective for coarse storyline/scene segmentation and for locating candidate
+            segments that may contain target actions/objects/scenes. Use specialized observers afterward
+            to confirm and extract detailed evidence.
+        - Guidance: the model's reply for a slice may include finer-grained time-range references
+            within that slice; treat these as hints for subsequent tools rather than authoritative
+            timestamps.
+        - The sampling budget is constrained by the stricter of fps and max_total_frames (including default). The tool's frame limit is the default value of max_total_frames.
+
+    _type: func
+    base_fps: &scanO_base_fps 0.25
+    base_frame_num: &scanO_total_frames 180
+    defs:
+      TimeInterval:
+        type: object
+        description: >
+          Time interval in seconds. 
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec:   { type: number, exclusiveMinimum: 0 }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+
+    arguments:
+      global_interval:
+        description: The time range to scan (TimeInterval).
+        $ref: "#/$defs/TimeInterval"
+        required: true
+
+      # The backend enforces exactly one of num_slices or slice_duration_sec.
+      num_slices:
+        description: Number of equal slices (mutually exclusive with slice_duration_sec).
+        type: integer
+        minimum: 1
+
+      slice_duration_sec:
+        description: Duration per slice in seconds (mutually exclusive with num_slices).
+        type: number
+        exclusiveMinimum: 0
+
+      query:
+        description: The question for the MLLM to search relevant content; e.g., "Find the scenes with a year text in the caption (four digits)."
+        type: string
+        required: true
+
+      fps:
+        description: Sampling rate (fps) of each sliced interval. Must be given when max_total_frames is omitted.
+        type: number
+        exclusiveMinimum: 0
+        default: *scanO_base_fps
+
+      max_total_frames:
+        description: The total frame sum of all sliced intervals. Must be given when max_total_frames is omitted. The default value is the max sampled frame number of the tool.
+        type: integer
+        minimum: 1
+        default: *scanO_total_frames
+
+  - name: finish
+    class: finish
+    description: Call this function after confirming the answer of the user's question, and finish the conversation.
+    _type: func
+    arguments:
+      answer:
+        description: The final answer to the user's question.
+        type: string
+        required: True
+    defaults: {}

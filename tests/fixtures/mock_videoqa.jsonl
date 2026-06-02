@@ -1,0 +1,2 @@
+{"id": "mock-1", "video_path": "mock_video.mp4", "duration": 2.0, "question": "What color is the synthetic video background?\n(A) Blue\n(B) Red\n(C) Green\n(D) Yellow", "answer": "A", "question_type": "multiple-choice"}
+
