@@ -63,7 +63,7 @@ res = d.call_tool(
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 from utils.tool_patch import ToolDispatcher  # base + registry loading
 from utils.tool_registry import get_tool_class
@@ -102,6 +102,7 @@ class CallContext:
     prompt_time_range: Optional[float] = None
     clip_policy: str = "intersect"
     min_span_sec: float = 1e-6
+    allowed_interval: Optional[Tuple[float, float]] = None
 
 
 class VCSDispatcher(ToolDispatcher):
@@ -148,11 +149,13 @@ class VCSDispatcher(ToolDispatcher):
         tool_call: Dict[str, Any],
         *,
         video_path: str,
-        subtitles: str = None,
+        subtitles: Any = None,
         duration_sec: float,
         prompt_time_range: Optional[float] = None,
         clip_policy: str = "intersect",
         min_span_sec: float = 1e-6,
+        allowed_interval: Optional[Tuple[float, float]] = None,
+        max_budget_cap: Optional[int] = None,
     ) -> Any:
         """Invoke a registered tool with normalized arguments.
 
@@ -171,22 +174,37 @@ class VCSDispatcher(ToolDispatcher):
             How to handle out-of-bounds intervals.
         min_span_sec: float
             Minimum span required after clipping.
+        allowed_interval: tuple(float, float), optional
+            Optional sub-window ``(start, end)`` constraining Actor tool calls.
+        max_budget_cap: int, optional
+            Optional frame cap enforcing Actor or phase frame budgets.
         """
         if not isinstance(tool_call, dict) or "name" not in tool_call:
             raise ValueError("tool_call must be a dict with a 'name' key")
 
         args = dict(tool_call.get("arguments", {}) or {})
+        name = tool_call["name"].lower()
         if self.subject_registry and isinstance(args, dict):
-            tool_name = (tool_call.get("name") or "").lower()
-            if tool_name and tool_name != "finish":
+            if name and name not in {"finish", "submit_report"}:
                 args.setdefault("subject_registry", True)
+
+        if max_budget_cap is not None and int(max_budget_cap) > 0:
+            cap = int(max_budget_cap)
+            if name == "overview_observer":
+                req_n = args.get("num_frames")
+                args["num_frames"] = min(int(req_n), cap) if req_n is not None else cap
+            elif name not in {"finish", "submit_report"}:
+                req_max = args.get("max_total_frames")
+                args["max_total_frames"] = min(int(req_max), cap) if req_max is not None else cap
+
         ctx = CallContext(
             video_path=video_path,
             duration_sec=float(duration_sec),
             prompt_time_range=prompt_time_range,
             clip_policy=clip_policy,
             min_span_sec=float(min_span_sec),
-            subtitles=subtitles
+            subtitles=subtitles,
+            allowed_interval=allowed_interval,
         )
 
         args["video_path"] = ctx.video_path
@@ -194,7 +212,6 @@ class VCSDispatcher(ToolDispatcher):
         if ctx.prompt_time_range is not None:
             args["prompt_time_range"] = float(ctx.prompt_time_range)
 
-        name = tool_call["name"].lower()
         if name == "segment_probe":
             args = self._normalize_single(args, ctx)
         elif name == "stitched_probe":
@@ -247,8 +264,20 @@ class VCSDispatcher(ToolDispatcher):
             self._registry[tool_name.lower()] = tool_instance
             
     @property
-    def tool_format_schema(self) -> list[dict[str, Any]] | None:   
+    def tool_format_schema(self) -> list[dict[str, Any]] | None:
         return getattr(self, "_tool_format_schema", None)
+
+    def get_tool_schemas(self, allowed_names: Optional[set[str]] = None) -> list[dict[str, Any]]:
+        """Return OpenAI tool schemas optionally filtered by tool name."""
+        schemas = self.tool_format_schema or []
+        if allowed_names is None:
+            return list(schemas)
+        allowed_lower = {n.lower() for n in allowed_names}
+        return [
+            t for t in schemas
+            if t.get("type") == "function"
+            and (t.get("function", {}).get("name") or "").lower() in allowed_lower
+        ]
     
     def _entry_to_schema(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -432,49 +461,60 @@ class VCSDispatcher(ToolDispatcher):
 
     def _normalize_best_effort(self, args: Dict[str, Any], ctx: CallContext) -> Dict[str, Any]:
         out = dict(args)
-        # Common keys we may safely clip if present
         for key in ("interval", "global_interval"):
             if key in out and isinstance(out[key], dict):
                 ci = self._clip_interval(out[key], ctx)
                 if ci is None:
-                    out.pop(key)
-                else:
-                    out[key] = ci
+                    lo = 0.0 if ctx.allowed_interval is None else max(0.0, ctx.allowed_interval[0])
+                    hi = ctx.duration_sec if ctx.allowed_interval is None else min(ctx.duration_sec, ctx.allowed_interval[1])
+                    raise ValueError(
+                        f"'{key}' {out[key]} has no overlap with allowed bounds [{lo:.1f}, {hi:.1f}]."
+                    )
+                out[key] = ci
         if "segments" in out and isinstance(out["segments"], list):
             segs: List[Dict[str, Any]] = []
             for seg in out["segments"]:
-                if not isinstance(seg, dict) or "interval" not in seg:
+                if not isinstance(seg, dict):
                     continue
-                ci = self._clip_interval(seg["interval"], ctx)
-                if ci is not None:
-                    segs.append({**seg, "interval": ci})
+                if "interval" in seg and isinstance(seg["interval"], dict):
+                    ci = self._clip_interval(seg["interval"], ctx)
+                    if ci is not None:
+                        segs.append({**seg, "interval": ci})
+                elif "start_sec" in seg and "end_sec" in seg:
+                    ci = self._clip_interval(seg, ctx)
+                    if ci is not None:
+                        updated = {**seg, **ci}
+                        segs.append(updated)
+            if out["segments"] and not segs:
+                raise ValueError("No valid segments remain after clipping to allowed bounds.")
             out["segments"] = segs
         return out
 
     # --- low-level interval utilities ----------------------------------
     def _clip_interval(self, itv: Dict[str, Any], ctx: CallContext) -> Optional[Dict[str, float]]:
-        """Clip [start, end] to [0, duration]; enforce min span.
-
-        Returns None when the interval is invalid or must be dropped.
-        """
+        """Clip [start, end] to [0, duration] and optional ``allowed_interval``."""
         try:
             s = float(itv.get("start_sec", 0.0))
             e = float(itv.get("end_sec", 0.0))
         except Exception as exc:
             raise ValueError(f"invalid interval fields: {itv}") from exc
 
+        lo = 0.0
+        hi = ctx.duration_sec
+        if ctx.allowed_interval is not None:
+            lo = max(lo, float(ctx.allowed_interval[0]))
+            hi = min(hi, float(ctx.allowed_interval[1]))
+
         if ctx.clip_policy not in {"intersect", "drop"}:
             raise ValueError("clip_policy must be 'intersect' or 'drop'")
 
         if ctx.clip_policy == "drop":
-            # Strict drop if any part is outside bounds
-            if s < 0.0 or e > ctx.duration_sec or e <= s:
+            if s < lo or e > hi or e <= s:
                 return None
             return {"start_sec": s, "end_sec": e}
 
-        # intersect policy (default): clamp to bounds then validate
-        s = max(0.0, min(s, ctx.duration_sec))
-        e = max(0.0, min(e, ctx.duration_sec))
+        s = max(lo, min(s, hi))
+        e = max(lo, min(e, hi))
         if e - s < ctx.min_span_sec:
             return None
         return {"start_sec": s, "end_sec": e}

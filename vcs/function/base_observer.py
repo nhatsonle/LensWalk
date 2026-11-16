@@ -1,26 +1,38 @@
 
 from abc import abstractmethod
-import json
-from typing import List, Dict, Any, Optional, Union
-import numpy as np
 import base64
+from io import BytesIO
+import json
 import os
-import cv2
-import time
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+from PIL import Image
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional when decord+PIL fallback is used
+    cv2 = None
 
 from utils.tool_base import ToolBase
 from ..data_models import Observation, TimeInterval
+from ..llm_client import build_llm_client, resolve_api_credentials
 from ..prompts import SUBJECT_REGISTRY_JSON_PROMPT
 
 try:
     from openai import OpenAI, OpenAIError
 except Exception:
     OpenAI = None
+
     class OpenAIError(Exception):
         pass
+
+
+_DEFAULT_OPENAI_CLS = OpenAI
 
 class BaseVideoObserver(ToolBase):
     """Base class for video observation tools.
@@ -50,12 +62,18 @@ class BaseVideoObserver(ToolBase):
         self.base_frame_num = int(base_frame_num)
         self.base_max_edge_length = int(base_max_edge_length)
 
-        self.openai_base_url = openai_base_url or os.getenv("TOOL_OPENAI_BASE_URL")
-        self.openai_key = openai_key or os.getenv("TOOL_OPENAI_API_KEY")
+        creds = resolve_api_credentials(
+            for_tool=True,
+            api_key=openai_key,
+            base_url=openai_base_url,
+        )
+        self.openai_base_url = creds["base_url"]
+        self.openai_key = creds["api_key"]
+        self.openai_api_version = creds["api_version"]
         if os.getenv("MLLM_BACKEND") is not None or isinstance(mllm_backend, str):
             self.mllm_backend = {"type": "api", "model": os.getenv("MLLM_BACKEND") or mllm_backend}
         else:
-            self.mllm_backend = mllm_backend or {"type": "api", "model": "gemini-2.5-flash"}        
+            self.mllm_backend = mllm_backend or {"type": "api", "model": "gemini-2.5-flash"}
         self.use_time_prompt = use_time_prompt
         if self.use_time_prompt:
             print(f"{self.__class__.__name__}: using timestamps for VLM calls.")
@@ -135,12 +153,21 @@ class BaseVideoObserver(ToolBase):
     def _func_call(self, params: Dict[str, Any]) -> Any:
         pass
 
-    def _img_to_data_url(self, img_bgr) -> str:
-        """OpenCV BGR -> JPEG -> base64 data URL (image/jpeg)"""
-        ok, buf = cv2.imencode(".jpg", img_bgr)
-        if not ok:
-            raise RuntimeError("Failed to encode frame as JPEG.")
-        b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+    def _img_to_data_url(self, img_arr, *, is_rgb: Optional[bool] = None) -> str:
+        """Encode BGR (OpenCV) or RGB (Decord/PIL) frame array into JPEG base64 data URL."""
+        if is_rgb is None:
+            is_rgb = cv2 is None
+        if cv2 is not None and not is_rgb:
+            ok, buf = cv2.imencode(".jpg", img_arr)
+            if not ok:
+                raise RuntimeError("Failed to encode frame as JPEG.")
+            raw_bytes = buf.tobytes()
+        else:
+            img = Image.fromarray(img_arr)
+            out_buf = BytesIO()
+            img.save(out_buf, format="JPEG")
+            raw_bytes = out_buf.getvalue()
+        b64 = base64.b64encode(raw_bytes).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
 
     def _decide_workers(self, group_count: int) -> int:
@@ -156,12 +183,18 @@ class BaseVideoObserver(ToolBase):
         return max(1, min(hw, group_count))
 
     def _build_api_client(self):
-        """Build the OpenAI-compatible API client and model name."""
-        if OpenAI is None:
-            raise RuntimeError("The openai SDK is not installed. Install it with `pip install openai`.")
+        """Build the LiteLLM/OpenAI-compatible API client and model name."""
         if not self.openai_key:
-            raise ValueError("API backend requires openai_key.")
-        client = OpenAI(api_key=self.openai_key, base_url=self.openai_base_url)
+            raise ValueError("API backend requires an API key (TOOL_OPENAI_API_KEY or OPENAI_API_KEY).")
+        if OpenAI is not None and OpenAI is not _DEFAULT_OPENAI_CLS:
+            client = OpenAI(api_key=self.openai_key, base_url=self.openai_base_url)
+        else:
+            client = build_llm_client(
+                for_tool=True,
+                api_key=self.openai_key,
+                base_url=self.openai_base_url,
+                api_version=getattr(self, "openai_api_version", None),
+            )
         model_name = self.mllm_backend.get("model", "gpt-4o-mini")
         return client, model_name
     
@@ -172,9 +205,18 @@ class BaseVideoObserver(ToolBase):
     ) -> Optional[str]:
         """Extract subtitle lines that overlap the requested interval(s)."""
 
-        def _time_to_seconds(t: str) -> float:
-            h, m, s = t.split(":")
-            return int(h) * 3600 + int(m) * 60 + float(s)
+        def _time_to_seconds(t: Any) -> float:
+            if isinstance(t, (int, float)):
+                return float(t)
+            s_val = str(t).strip()
+            if ":" not in s_val:
+                return float(s_val)
+            parts = s_val.replace(",", ".").split(":")
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+            return float(s_val)
 
         raw_subs = subtitle
 
@@ -182,10 +224,15 @@ class BaseVideoObserver(ToolBase):
         if raw_subs is None:
             return None
         for row in raw_subs:
-            s = _time_to_seconds(row["start"])
-            e = _time_to_seconds(row["end"])
+            raw_s = row.get("start", row.get("start_time"))
+            raw_e = row.get("end", row.get("end_time"))
+            if raw_s is None or raw_e is None:
+                continue
+            s = _time_to_seconds(raw_s)
+            e = _time_to_seconds(raw_e)
+            raw_text = row.get("line", row.get("subtitle", row.get("text", ""))) or ""
             text = (
-                row.get("line", "")
+                str(raw_text)
                 .replace("&nbsp;", " ")
                 .replace("\xa0", " ")
                 .strip()
@@ -326,14 +373,20 @@ class BaseVideoObserver(ToolBase):
 
     def _is_transient_error(self, exc: Exception) -> bool:
         """Return whether an exception is worth retrying."""
-        msg = str(exc)
+        msg = str(exc).lower()
         return (
             isinstance(exc, OpenAIError)
-            or "rate limit" in msg.lower()
-            or "timed out" in msg.lower()
-            or "too many requests" in msg.lower()
-            or "forbidden for url" in msg.lower()
-            or "internal" in msg.lower()
+            or "rate limit" in msg
+            or "timed out" in msg
+            or "timeout" in msg
+            or "too many requests" in msg
+            or "forbidden for url" in msg
+            or "internal" in msg
+            or "server had an error" in msg
+            or "service unavailable" in msg
+            or "429" in msg
+            or "502" in msg
+            or "503" in msg
         )
     
     def _call_with_backoff(

@@ -1,0 +1,224 @@
+tools:
+  - name: overview_observer
+    class: overview_observer
+    description: >
+      Uniformly samples the entire video into compact 2x4 grid sheets to build a
+      coarse whole-video storyline summary.
+    _type: func
+    base_fps: 0.1
+    base_frame_num: 64
+    base_max_edge_length: 256
+    short_side: 256
+    arguments:
+      num_frames:
+        description: Number of frames to uniformly sample across the whole video (rounded up to a multiple of 8).
+        type: integer
+        minimum: 8
+        default: 64
+
+  - name: dynamic_focus
+    class: dynamic_focus_observer
+    description: >
+      Unified visual inspection tool replacing separate skim/focus tools.
+      Inspects a continuous video interval [start_sec, end_sec] with adjustable
+      fps and spatial detail_level ("low" for fast broad scanning, "high" for
+      sharp visual details like text, small objects, or counting).
+      Always check the [Observed: ... | Actual FPS: ...] header in the response.
+    _type: func
+    base_fps: 1.0
+    base_frame_num: 32
+    base_max_edge_length: 320
+    low_edge_length: 320
+    high_edge_length: 720
+    defs:
+      TimeInterval:
+        type: object
+        description: Time interval in seconds.
+        properties:
+          start_sec: { type: number, minimum: 0, description: "Start time in seconds (>= 0)." }
+          end_sec: { type: number, exclusiveMinimum: 0, description: "End time in seconds (> start_sec)." }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+    arguments:
+      interval:
+        description: Continuous time range to observe.
+        $ref: "#/$defs/TimeInterval"
+        required: true
+      query:
+        description: Focused question for the visual observer within this interval.
+        type: string
+        required: true
+      fps:
+        description: Desired sampling rate in frames per second (> 0).
+        type: number
+        exclusiveMinimum: 0
+        default: 1.0
+      detail_level:
+        description: Spatial resolution mode ("low" for 320px broad scan, "high" for 720px fine detail).
+        type: string
+        enum: ["low", "high"]
+        default: "low"
+      max_total_frames:
+        description: Maximum frames to sample for this call (subject to remaining Actor budget).
+        type: integer
+        minimum: 1
+        default: 32
+
+  - name: scan_observer
+    class: per_segment_scan_observer
+    description: >
+      Partitions a long interval into equal slices (num_slices) or fixed-duration
+      slices (slice_duration_sec) and scans each slice in parallel to localize
+      candidate moments.
+    _type: func
+    base_fps: 0.25
+    base_frame_num: 96
+    defs:
+      TimeInterval:
+        type: object
+        description: Time interval in seconds.
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec: { type: number, exclusiveMinimum: 0 }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+    arguments:
+      global_interval:
+        description: Time interval to partition and scan.
+        $ref: "#/$defs/TimeInterval"
+        required: true
+      num_slices:
+        description: Number of equal slices (mutually exclusive with slice_duration_sec).
+        type: integer
+        minimum: 1
+      slice_duration_sec:
+        description: Duration per slice in seconds (mutually exclusive with num_slices).
+        type: number
+        exclusiveMinimum: 0
+      query:
+        description: Search query to evaluate per slice.
+        type: string
+        required: true
+      fps:
+        description: Sampling rate per slice.
+        type: number
+        exclusiveMinimum: 0
+        default: 0.25
+      max_total_frames:
+        description: Maximum total frames across all slices.
+        type: integer
+        minimum: 1
+        default: 96
+
+  - name: stitched_observer
+    class: stitched_segment_observer
+    description: >
+      Stitches multiple disjoint time segments into one unified visual context
+      for cross-moment comparison, counting, or causal verification.
+    _type: func
+    base_fps: 0.5
+    base_frame_num: 96
+    base_segment_fps: 1.0
+    defs:
+      TimeInterval:
+        type: object
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec: { type: number, exclusiveMinimum: 0 }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+      SubTimeIntervalWFPS:
+        type: object
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec: { type: number, exclusiveMinimum: 0 }
+          fps: { type: number, exclusiveMinimum: 0, default: 1.0 }
+        required: [start_sec, end_sec, fps]
+        additionalProperties: false
+    arguments:
+      segments:
+        description: Non-empty list of time segments with per-segment sampling fps.
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/$defs/SubTimeIntervalWFPS"
+        required: true
+      query:
+        description: Unified verification question across the stitched segments.
+        type: string
+        required: true
+      global_interval:
+        description: Optional enclosing time interval.
+        $ref: "#/$defs/TimeInterval"
+      fps:
+        description: Base fps when global_interval is provided.
+        type: number
+        exclusiveMinimum: 0
+        default: 0.5
+      max_total_frames:
+        description: Maximum total frames across stitched segments.
+        type: integer
+        minimum: 1
+        default: 96
+
+  - name: submit_report
+    class: submit_report
+    description: >
+      Submit the Actor's structured evidence report and finish investigating the
+      assigned hypothesis. Set status="NOT_FOUND" and candidate_answer=null if
+      evidence is absent or insufficient.
+    _type: func
+    defs:
+      TimeInterval:
+        type: object
+        properties:
+          start_sec: { type: number, minimum: 0 }
+          end_sec: { type: number, exclusiveMinimum: 0 }
+        required: [start_sec, end_sec]
+        additionalProperties: false
+      EvidenceItem:
+        type: object
+        properties:
+          interval:
+            $ref: "#/$defs/TimeInterval"
+          visual_fact:
+            type: string
+            description: Concrete visual observation directly seen in the sampled frames.
+          relevance:
+            type: string
+            enum: ["direct", "partial", "none"]
+        required: [interval, visual_fact, relevance]
+        additionalProperties: false
+    arguments:
+      status:
+        description: Investigation outcome ("FOUND", "PARTIAL", or "NOT_FOUND").
+        type: string
+        enum: ["FOUND", "PARTIAL", "NOT_FOUND"]
+        required: true
+      candidate_answer:
+        description: Candidate answer grounded in visual evidence, or null when NOT_FOUND.
+        type: string
+      confidence:
+        description: Confidence level based strictly on observed visual evidence.
+        type: string
+        enum: ["high", "medium", "low"]
+        required: true
+      evidences:
+        description: List of timestamped visual evidence items.
+        type: array
+        items:
+          $ref: "#/$defs/EvidenceItem"
+        required: true
+      uncertainties:
+        description: Gaps, ambiguities, or low-FPS limitations noticed during inspection.
+        type: string
+
+  - name: finish
+    class: finish
+    description: Return the final answer to the user's question.
+    _type: func
+    arguments:
+      answer:
+        description: The final answer string.
+        type: string
+        required: true

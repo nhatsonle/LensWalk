@@ -1,4 +1,15 @@
-import cv2
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional when decord+PIL fallback is used
+    cv2 = None
+
+try:
+    from decord import VideoReader, cpu as decord_cpu
+except Exception:  # pragma: no cover
+    VideoReader = None
+    decord_cpu = None
+
+from PIL import Image
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,11 +26,112 @@ def _resize_frame(frame: np.ndarray, max_edge: int) -> np.ndarray:
         return frame
     if h >= w:
         new_h = max_edge
-        new_w = int(round(w * (max_edge / h)))
+        new_w = max(1, int(round(w * (max_edge / h))))
     else:
         new_w = max_edge
-        new_h = int(round(h * (max_edge / w)))
-    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        new_h = max(1, int(round(h * (max_edge / w))))
+    if cv2 is not None:
+        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return np.array(Image.fromarray(frame).resize((new_w, new_h), Image.BICUBIC))
+
+
+def probe_video_metadata(video_path: str) -> Tuple[float, int, float]:
+    """Return ``(fps, total_frames, duration_sec)`` using OpenCV or Decord."""
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Cannot open video file: {video_path}")
+    if cv2 is not None:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Cannot open video file: {video_path}")
+        video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        if video_fps <= 0:
+            raise ValueError("Cannot read video FPS.")
+        duration = total_frames / video_fps if total_frames > 0 else 0.0
+        return video_fps, total_frames, duration
+    if VideoReader is not None:
+        vr = VideoReader(video_path, ctx=decord_cpu(0))
+        video_fps = float(vr.get_avg_fps() or 0.0)
+        total_frames = len(vr)
+        if video_fps <= 0:
+            raise ValueError("Cannot read video FPS.")
+        return video_fps, total_frames, total_frames / video_fps
+    raise RuntimeError("Neither OpenCV (cv2) nor decord is installed to read videos.")
+
+
+def _read_indices_decord(
+    video_path: str,
+    indices: List[int],
+    *,
+    max_edge_length: Optional[int] = None,
+    short_side: Optional[int] = None,
+) -> List[np.ndarray]:
+    """Read RGB frames at ``indices`` with Decord and optionally resize."""
+    if not indices:
+        return []
+    if VideoReader is None:
+        raise RuntimeError("decord is required when OpenCV (cv2) is not installed.")
+    vr = VideoReader(video_path, ctx=decord_cpu(0))
+    total = len(vr)
+    if total == 0:
+        return []
+    clamped = [min(max(0, int(idx)), total - 1) for idx in indices]
+    batch = vr.get_batch(clamped).asnumpy()
+    out: List[np.ndarray] = []
+    for frame in batch:
+        if short_side is not None:
+            h, w = frame.shape[:2]
+            scale = short_side / min(h, w)
+            th = max(1, int(round(h * scale)))
+            tw = max(1, int(round(w * scale)))
+            frame = np.array(Image.fromarray(frame).resize((tw, th), Image.BICUBIC))
+        elif max_edge_length is not None:
+            frame = _resize_frame(frame, max_edge_length)
+        out.append(frame)
+    return out
+
+
+def sample_uniform_frames_rgb(
+    video_path: str,
+    num_frames: int,
+    short_side: int = 256,
+) -> Tuple[List[np.ndarray], List[int], List[float], float]:
+    """Uniformly sample ``num_frames`` RGB frames across the entire video."""
+    video_fps, total_frames, duration = probe_video_metadata(video_path)
+    if total_frames <= 0:
+        raise ValueError(f"Video has no frames: {video_path}")
+    indices = np.linspace(0, total_frames - 1, num_frames).astype(int).tolist()
+    timestamps = [round(idx / video_fps, 1) for idx in indices]
+
+    if VideoReader is not None:
+        frames = _read_indices_decord(video_path, indices, short_side=short_side)
+        return frames, indices, timestamps, duration
+
+    if cv2 is None:
+        raise RuntimeError("Neither decord nor cv2 is available to decode frames.")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video file: {video_path}")
+    frames: List[np.ndarray] = []
+    last_pos = -1
+    for idx in indices:
+        if idx != last_pos + 1:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame_bgr = cap.read()
+        if not ok or frame_bgr is None:
+            continue
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w = frame_rgb.shape[:2]
+        scale = short_side / min(h, w)
+        th = max(1, int(round(h * scale)))
+        tw = max(1, int(round(w * scale)))
+        frame_rgb = np.array(Image.fromarray(frame_rgb).resize((tw, th), Image.BICUBIC))
+        frames.append(frame_rgb)
+        last_pos = idx
+    cap.release()
+    return frames, indices, timestamps, duration
 
 
 def _build_disjoint_intervals_with_fps(
@@ -127,6 +239,9 @@ def _multithread_read_and_resize(
     if not sorted_indices:
         return []
 
+    if cv2 is None:
+        return _read_indices_decord(video_path, sorted_indices, max_edge_length=max_edge_length)
+
     if num_workers is None or num_workers <= 0:
         try:
             hw_threads = cpu_count()
@@ -193,6 +308,12 @@ def _multithread_read_grouped(
     if piece_count == 0:
         return []
 
+    if cv2 is None:
+        flat_unique = sorted({idx for group in indices_per_piece for idx in group})
+        decoded = _read_indices_decord(video_path, flat_unique, max_edge_length=max_edge_length)
+        idx_to_img = {idx: img for idx, img in zip(flat_unique, decoded)}
+        return [[idx_to_img[idx] for idx in group if idx in idx_to_img] for group in indices_per_piece]
+
     if num_workers is None or num_workers <= 0:
         try:
             hw_threads = cpu_count()
@@ -257,15 +378,7 @@ def extract_and_resize_frames(
     prompt_time_range: Optional[float] = None
 ) -> Tuple[Any, Budget]:
     """Sample and resize frames for segment, stitched, or scan observers."""
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Cannot open video file: {video_path}")
-    cap_probe = cv2.VideoCapture(video_path)
-    if not cap_probe.isOpened():
-        raise FileNotFoundError(f"Cannot open video file: {video_path}")
-    video_fps = cap_probe.get(cv2.CAP_PROP_FPS)
-    cap_probe.release()
-    if not video_fps or video_fps <= 0:
-        raise ValueError("Cannot read video FPS.")
+    video_fps, _, _ = probe_video_metadata(video_path)
 
     pieces: List[Tuple[float, float, float]]
     if global_interval is not None and base_fps is not None:
