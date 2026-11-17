@@ -209,8 +209,14 @@ class _LiteLLMCompletions:
             raw_resp = litellm.completion(**call_kwargs)
         except Exception as exc:
             msg = str(exc).lower()
+            retried = False
             if "temperature" in call_kwargs and "temperature" in msg:
                 call_kwargs.pop("temperature", None)
+                retried = True
+            if self.api_base and "llm provider not provided" in msg and "custom_llm_provider" not in call_kwargs:
+                call_kwargs["custom_llm_provider"] = "openai"
+                retried = True
+            if retried:
                 raw_resp = litellm.completion(**call_kwargs)
             else:
                 raise

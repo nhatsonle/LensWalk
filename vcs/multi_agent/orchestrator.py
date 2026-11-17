@@ -192,6 +192,7 @@ class MultiAgentCoordinator:
         except Exception as exc:
             err_msg = str(exc) or repr(exc)
             overview_text = f"Overview failed: {err_msg}"
+            state.log(f"[Phase 0: Overview] ERROR: {err_msg}")
 
         t1 = time.time()
         # Coarse whole-video overview does NOT mark segments as covered for fallback.

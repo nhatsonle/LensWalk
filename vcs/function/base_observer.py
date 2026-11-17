@@ -5,6 +5,7 @@ from io import BytesIO
 import json
 import os
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -377,6 +378,8 @@ class BaseVideoObserver(ToolBase):
         return (
             isinstance(exc, OpenAIError)
             or "rate limit" in msg
+            or "usage limit" in msg
+            or "reset after" in msg
             or "timed out" in msg
             or "timeout" in msg
             or "too many requests" in msg
@@ -384,6 +387,7 @@ class BaseVideoObserver(ToolBase):
             or "internal" in msg
             or "server had an error" in msg
             or "service unavailable" in msg
+            or "serviceunavailableerror" in msg
             or "429" in msg
             or "502" in msg
             or "503" in msg
@@ -414,7 +418,10 @@ class BaseVideoObserver(ToolBase):
                         return None
                     delay *= exponential_base * (1 + (random.random() if jitter else 0.0))
                     delay = min(20, delay)
-                    print(f"Retrying in {delay:.2f}s due to: {str(e)}")
+                    reset_m = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", str(e), re.IGNORECASE)
+                    if reset_m:
+                        delay = min(120.0, float(reset_m.group(1)) + 2.0)
+                    print(f"Retrying in {delay:.2f}s due to: {str(e)}", flush=True)
                     time.sleep(delay)
                 else:
                     print(str(e))

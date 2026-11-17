@@ -19,6 +19,8 @@ _TIMESTAMP_PATTERNS = (
 
 _TRANSIENT_MARKERS = (
     "rate limit",
+    "usage limit",
+    "reset after",
     "timed out",
     "timeout",
     "too many requests",
@@ -26,11 +28,14 @@ _TRANSIENT_MARKERS = (
     "internal",
     "server had an error",
     "service unavailable",
+    "serviceunavailableerror",
     "connection",
     "429",
     "502",
     "503",
 )
+
+_RESET_AFTER_RE = re.compile(r"reset after\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
 
 
 def has_explicit_timestamp(question: str) -> bool:
@@ -106,7 +111,12 @@ def call_chat_with_retry(
             is_transient = any(tok in msg for tok in _TRANSIENT_MARKERS) or "openai" in type(exc).__name__.lower()
             if not is_transient or attempt == max_retries - 1:
                 raise
-            time.sleep(min(20.0, delay))
+            wait_sec = min(20.0, delay)
+            reset_match = _RESET_AFTER_RE.search(str(exc))
+            if reset_match:
+                wait_sec = min(120.0, float(reset_match.group(1)) + 2.0)
+            print(f"[LLM Retry {attempt + 1}/{max_retries}] {type(exc).__name__}: {exc} (sleeping {wait_sec:.1f}s)", flush=True)
+            time.sleep(wait_sec)
             delay *= 2.0
     return None
 
